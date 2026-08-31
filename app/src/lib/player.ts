@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-inferrable-types */
 import { browser } from "$app/environment";
+import { SERVER_DOMAIN } from "../env";
 import { SessionListService } from "$stores/list/sessionList";
 import type { UserSettings } from "$stores/settings";
 import Hls, { type HlsConfig } from "hls.js";
@@ -35,13 +36,38 @@ interface AudioPlayerEvents {
 	"update:stream_type": { type: "HLS" | "HTTP" };
 }
 
+/**
+ * googlevideo.com stream URLs are bound to the IP address that requested
+ * them from YouTube (in our case, this backend server). If the browser
+ * fetches that URL directly - especially over a VPN, or from a network
+ * different than the server's - the IP mismatch can cause Google to refuse
+ * the request, which shows up in the browser as a generic
+ * "MEDIA_ELEMENT_ERROR: Format error". Routing the request back through our
+ * own backend (which requested the URL in the first place) avoids that
+ * mismatch entirely, regardless of the client's network/VPN.
+ */
+function toProxiedStreamUrl(url: string): string {
+	if (!url) return url;
+	try {
+		const parsed = new URL(url);
+		if (!parsed.hostname.endsWith("googlevideo.com")) return url;
+	} catch {
+		return url;
+	}
+	return `${SERVER_DOMAIN}/api/v1/proxy.stream?url=${encodeURIComponent(url)}`;
+}
+
 const setPosition = (currentTime: number, duration: number) => {
 	if ("mediaSession" in navigator) {
-		console.log({ currentTime, duration });
-		navigator.mediaSession.setPositionState({
-			duration: duration,
-			position: currentTime,
-		});
+		try {
+			navigator.mediaSession.setPositionState({
+				duration: duration,
+				position: currentTime,
+			});
+		} catch {
+			// duration/position can briefly be NaN/invalid mid-track-change;
+			// the next timeupdate tick will retry, so this is safe to ignore.
+		}
 	}
 };
 
@@ -58,26 +84,46 @@ function metaDataHandler({
 		const position = sessionList.position;
 		const currentTrack = sessionList.mix[position];
 
-		const artwork = currentTrack?.thumbnails;
+		if (!currentTrack) return;
 
-		console.debug({ currentTrack, position, mix: sessionList.mix });
+		// .slice() first - .reverse() mutates in place, and `thumbnails` is
+		// the same array reference kept on the track object, so calling
+		// this repeatedly (every timeupdate-triggered metadata refresh)
+		// would otherwise flip the artwork order back and forth.
+		const artwork = (currentTrack.thumbnails ?? []).slice().reverse();
 
-		if (!currentTrack) return console.debug("no current track");
 		navigator.mediaSession.metadata = new MediaMetadata({
 			title: currentTrack?.title,
 			artist: currentTrack?.artistInfo?.artist?.[0]?.text || "",
 			album: currentTrack?.album?.title ?? undefined,
-			artwork: artwork.reverse().map(({ url, width, height }) => ({
+			artwork: artwork.map(({ url, width, height }) => ({
 				src: url,
 				sizes: `${width}x${height}`,
 				type: "image/jpeg",
 			})),
 		});
-		navigator.mediaSession.setActionHandler("play", () => {
+
+		// Wrapped in try/catch: some browsers (older Safari/Firefox) throw
+		// a TypeError for action types they don't recognize instead of
+		// silently ignoring them, which would otherwise abort every
+		// handler registered after the unsupported one.
+		const setAction = (
+			action: MediaSessionAction,
+			handler: MediaSessionActionHandler | null,
+		) => {
+			try {
+				navigator.mediaSession.setActionHandler(action, handler);
+			} catch {
+				// Unsupported action for this browser - safe to ignore.
+			}
+		};
+
+		setAction("play", () => {
 			AudioPlayer.play();
 		});
-		navigator.mediaSession.setActionHandler("pause", () => AudioPlayer.pause());
-		navigator.mediaSession.setActionHandler("seekto", (session) => {
+		setAction("pause", () => AudioPlayer.pause());
+		setAction("stop", () => AudioPlayer.pause());
+		setAction("seekto", (session) => {
 			if (session.fastSeek && "fastSeek" in AudioPlayer) {
 				session.seekTime && AudioPlayer.fastSeek(session.seekTime);
 				setPosition(
@@ -93,12 +139,8 @@ function metaDataHandler({
 				AudioPlayer.duration,
 			);
 		});
-		navigator.mediaSession.setActionHandler("previoustrack", () =>
-			SessionListService.previous(),
-		);
-		navigator.mediaSession.setActionHandler("nexttrack", () =>
-			SessionListService.next(),
-		);
+		setAction("previoustrack", () => SessionListService.previous());
+		setAction("nexttrack", () => SessionListService.next());
 		setPosition(currentTime, duration);
 	}
 }
@@ -323,7 +365,7 @@ class AudioPlayerImpl extends EventEmitter<AudioPlayerEvents> {
 	public set videoNode(node: HTMLVideoElement | undefined) {
 		this.videoPlayer = node;
 		if (this.videoPlayer && this._videoUrl.value) {
-			this.videoPlayer.src = this._videoUrl.value;
+			this.videoPlayer.src = toProxiedStreamUrl(this._videoUrl.value);
 			this.videoPlayer.load();
 			this.videoPlayer.currentTime = this.currentTime;
 			this.videoPlayer.play();
@@ -488,13 +530,14 @@ class AudioPlayerImpl extends EventEmitter<AudioPlayerEvents> {
 		if (url === undefined) return;
 
 		if (videoUrl && this.videoPlayer) {
-			this.videoPlayer.src = videoUrl;
+			this.videoPlayer.src = toProxiedStreamUrl(videoUrl);
 		}
 		this._videoUrl.set(videoUrl);
 		if (this.playerKind === "hls") {
 			this.loadHLS(url);
 		} else {
-			this.player.src = url;
+			this.originalStreamUrl = url;
+			this.player.src = toProxiedStreamUrl(url);
 		}
 
         if (duration != undefined && duration != -1){
@@ -541,11 +584,12 @@ class AudioPlayerImpl extends EventEmitter<AudioPlayerEvents> {
 		});
 	}
 	private errorCount = 0;
+	private originalStreamUrl: string | undefined;
 	private handleError() {
 		if (++this.errorCount > 2) {
 			this.errorCount = 0;
 			this.updateSrc({
-				url: createFallbackUrl(this.player.src),
+				url: createFallbackUrl(this.originalStreamUrl ?? this.player.src),
 			});
 		}
 	}
