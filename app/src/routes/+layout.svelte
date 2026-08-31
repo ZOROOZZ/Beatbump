@@ -131,6 +131,18 @@
             Logger.err(err);
         }
         syncTabs.connect();
+
+        // Register the service worker so the app is installable to the
+        // home screen / dock. Being installed (standalone display mode) is
+        // what makes mobile OSes reliably keep audio playing in the
+        // background and show the now-playing controls in the
+        // notification shade / lock screen / Control Center, the same way
+        // Spotify or YouTube Music does.
+        if ("serviceWorker" in navigator) {
+            navigator.serviceWorker
+                .register("/service-worker.js", { type: dev ? "module" : "classic" })
+                .catch((err) => Logger.err(err));
+        }
     });
     let info: Record<string, any> = {};
 </script>
