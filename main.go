@@ -32,6 +32,7 @@ func main() {
 	e.GET("/api/v1/main.json", api.AlbumEndpointHandler)
 	e.GET("/api/v1/get_queue.json", api.GetQueueHandler)
 	e.GET("/api/v1/get_search_suggestions.json", api.GetSearchSuggstionsHandler)
+	e.GET("/api/v1/proxy.stream", api.ProxyStreamHandler)
 
 	e.GET("/api/v1/home.json", api.HomeEndpointHandler)
 	e.GET("/api/v1/explore/:category", api.ExploreEndpointHandler)
